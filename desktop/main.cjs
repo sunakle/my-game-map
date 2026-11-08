@@ -14,6 +14,7 @@ app.whenReady().then(() => {
   });
   Menu.setApplicationMenu(null);
   const window = new BrowserWindow({
+    icon: path.join(__dirname, 'map-studio.png'),
     title: 'Мастерская карт', width: 1440, height: 920, minWidth: 840, minHeight: 580, backgroundColor: '#303136',
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), sandbox: true, contextIsolation: true }
   });
