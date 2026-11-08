@@ -4,10 +4,14 @@ import { defaultColors, descendants, names, newNode, newProject } from './model'
 import { Viewport, type Tool } from './Viewport';
 import { deleteProject, listProjects, loadAsset, loadProject, saveAsset, saveProject, storeImportedProject } from './storage';
 import { exportArchive, importArchive } from './archive';
+import { Glyph, ToolDialog, ShapePanel, meshInput, commands, command } from './ModelTools';
+import { solidDefault, solidNames, type Primitive } from './solids';
+import { validateProject } from './model';
 import './styles.css';
+import './modeling.css';
 
 const icon: Record<Kind, string> = {
-  tree: '🌳', pine: '🌲', bush: '🌿', rock: '🪨', grass: '🌾', flower: '✿', water: '≈', road: '▰',
+  solid:'◇', tree: '🌳', pine: '🌲', bush: '🌿', rock: '🪨', grass: '🌾', flower: '✿', water: '≈', road: '▰',
   bridge: '⌁', fence: '♜', wall: '▥', tower: '♖', platform: '▣', sprite: '▧', group: '▤',
 };
 const categories: { title: string; kinds: Kind[] }[] = [
@@ -42,14 +46,21 @@ function App() {
   const [projects, setProjects] = useState<MapProject[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const [selectedNote, setSelectedNote] = useState<string | null>(null);
-  const [tool, setTool] = useState<Tool>('move');
+  const [tool, setTool] = useState<Tool>('select');
   const [placeKind, setPlaceKind] = useState<Kind | null>(null);
-  const [leftTab, setLeftTab] = useState<'library' | 'layers' | 'notes'>('library');
+  const [leftTab, setLeftTab] = useState<'library' | 'layers' | 'notes'>('layers');
   const [status, setStatus] = useState('Готово');
   const [toast, setToast] = useState('');
   const [assetUrls, setAssetUrls] = useState<Record<string, string>>({});
   const [collapsed, setCollapsed] = useState<string[]>([]);
   const [showFiles, setShowFiles] = useState(false);
+  const [dialog,setDialog] = useState<'add'|'help'|null>(null);
+  const [editing,setEditing] = useState<string|null>(null), [face,setFace]=useState(-1);
+  const [rail,setRail]=useState(true), [properties,setProperties]=useState(true), [nativeBusy,setNativeBusy]=useState(false);
+  const selectedNode = project?.nodes.find(n=>n.id===selected[0]);
+  const canEdit = selected.length===1 && !!selectedNode?.solid && !selectedNode.solid.mesh && !selectedNode.locked;
+  const editMode = canEdit && selected[0]===editing;
+  const toggleEdit=()=>{if(canEdit){setFace(-1);setEditing(editMode?null:selected[0]);setPlaceKind(null);}};
   const archiveInput = useRef<HTMLInputElement>(null);
   const pngInput = useRef<HTMLInputElement>(null);
   const history = useRef<{ past: MapProject[]; future: MapProject[] }>({ past: [], future: [] });
@@ -59,7 +70,20 @@ function App() {
   const revision = useRef(0);
   const savedRevision = useRef(0);
 
-  useEffect(() => { listProjects().then(setProjects).catch(() => setStatus('Хранилище недоступно')); }, []);
+  useEffect(() => {
+    let mounted=true;
+    (async()=>{
+      const items=await listProjects();
+      if(!mounted)return;
+      setProjects(items);
+      const last=localStorage.getItem('map-last-project');
+      if(last==='home')return;
+      const existing=items.find(item=>item.id===last)??items[0];
+      if(existing){await open(existing);return;}
+      await create();
+    })().catch(()=>setStatus('Хранилище недоступно'));
+    return ()=>{mounted=false;};
+  }, []);
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(''), 4200);
@@ -107,14 +131,22 @@ function App() {
     else await saveQueue.current;
   }, [queueSave]);
 
+  useEffect(()=>{
+    const leaving=()=>{if(document.visibilityState==='hidden')void flush();};
+    document.addEventListener('visibilitychange',leaving);
+    return ()=>document.removeEventListener('visibilitychange',leaving);
+  },[flush]);
+  useEffect(()=>window.mapWindow?.beforeClose(async()=>{await flush();return !projectRef.current || savedRevision.current===revision.current;}),[flush]);
+
   const open = async (next: MapProject) => {
     await flush();
+    localStorage.setItem("map-last-project",next.id);
     projectRef.current = next;
     setProject(next);
     history.current = { past: [], future: [] };
     revision.current = 0;
     savedRevision.current = 0;
-    setSelected([]); setSelectedNote(null); setPlaceKind(null);
+    setSelected([]); setSelectedNote(null); setPlaceKind(null); setEditing(null); setFace(-1); setDialog(null);
     setStatus('Все изменения сохранены');
     try { setCollapsed(JSON.parse(localStorage.getItem(`map-collapsed:${next.id}`) || '[]')); }
     catch { setCollapsed([]); }
@@ -136,12 +168,13 @@ function App() {
 
   const create = async () => {
     const next = newProject();
+    const cube=newNode('solid',[0,0,0],{name:'Куб',solid:solidDefault('cube')});next.nodes.push(cube);
     await flush();
     await saveProject(next);
     setProjects(old => [next, ...old]);
-    await open(next);
+    await open(next);setSelected([cube.id]);
   };
-  const returnHome = async () => { await flush(); projectRef.current = null; setProject(null); setSelected([]); setShowFiles(false); setProjects(await listProjects()); };
+  const returnHome = async () => { await flush(); localStorage.setItem("map-last-project","home"); projectRef.current = null; setProject(null); setSelected([]); setShowFiles(false); setProjects(await listProjects()); };
   const choose = async (id: string) => { const next = await loadProject(id); if (next) await open(next); };
   const remove = async (item: MapProject) => {
     if (!window.confirm(`Удалить карту «${item.name}» и все её рисунки с этого устройства?`)) return;
@@ -149,6 +182,24 @@ function App() {
     setProjects(old => old.filter(value => value.id !== item.id));
   };
 
+  const addSolid=(primitive:Primitive)=>{
+    const node=newNode('solid',[0,0,0],{name:solidNames[primitive],solid:solidDefault(primitive)});
+    commit(old=>({...old,nodes:[...old.nodes,node]}));setSelected([node.id]);setSelectedNote(null);setLeftTab('layers');setEditing(null);setFace(-1);setPlaceKind(null);setDialog(null);
+  };
+  const nativeEdit=async()=>{
+    const target=selectedNode, source=projectRef.current;
+    if(!window.mapWindow||!source||!target?.solid||nativeBusy||target.locked)return;
+    setNativeBusy(true);
+    try{
+      const mesh=await window.mapWindow.editMesh(meshInput(target.name,target.solid));
+      if(!mesh)return;
+      const current=projectRef.current;
+      if(current?.id!==source.id || current.nodes.find(n=>n.id===target.id)?.solid!==target.solid){setToast('Карта или фигура изменилась за время сеанса.');return;}
+      const next={...solidDefault(target.solid.primitive),mesh};
+      validateProject({...current,nodes:current.nodes.map(n=>n.id===target.id?{...n,solid:next}:n)});
+      patchNodes({[target.id]:{solid:next}});setEditing(null);setFace(-1);setToast('Геометрия возвращена из Blender.');
+    }catch(e){setToast(e instanceof Error?e.message:'Не удалось открыть фигуру.');}finally{setNativeBusy(false);}
+  };
   const add = (kind: Kind, position: [number, number, number]) => {
     const node = newNode(kind, position);
     commit(old => ({ ...old, nodes: [...old.nodes, node] }));
@@ -248,7 +299,7 @@ function App() {
     const previous = history.current.past.pop(), current = projectRef.current;
     if (!previous || !current) return;
     history.current.future.push(current);
-    projectRef.current = previous; setProject(previous); setSelected([]);
+    projectRef.current = previous; setProject(previous); setStatus("Не сохранено"); setSelected(ids=>ids.filter(id=>previous.nodes.some(n=>n.id===id)));setFace(-1);
     const version = ++revision.current;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => queueSave(previous, version), 800);
@@ -257,7 +308,7 @@ function App() {
     const next = history.current.future.pop(), current = projectRef.current;
     if (!next || !current) return;
     history.current.past.push(current);
-    projectRef.current = next; setProject(next); setSelected([]);
+    projectRef.current = next; setProject(next); setStatus("Не сохранено");setSelected(ids=>ids.filter(id=>next.nodes.some(n=>n.id===id)));setFace(-1);
     const version = ++revision.current;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => queueSave(next, version), 800);
@@ -269,11 +320,24 @@ function App() {
       const target = event.target as HTMLElement;
       if (target.closest('input, textarea, select, [contenteditable="true"]')) return;
       const mod = event.ctrlKey || event.metaKey;
+      if (dialog || showFiles) { if(event.code==='Escape'){setDialog(null);setShowFiles(false);}return; }
+      if(event.defaultPrevented)return;
+      if(event.code==='Tab'&&!mod){event.preventDefault();toggleEdit();return;}
+      if(event.code==='KeyA' && event.shiftKey && !mod){event.preventDefault();setDialog('add');return;}
+      if(event.code==='KeyA'&&!mod){event.preventDefault();setSelected(event.altKey?[]:projectRef.current.nodes.filter(n=>n.visible&&!n.locked).map(n=>n.id));return;}
+      if(event.code==='KeyD'&&event.shiftKey&&!mod){event.preventDefault();duplicate();return;}
+      if(event.code==='KeyX'&&!mod){event.preventDefault();removeSelected();return;}
+      if(event.code==='KeyH'&&!mod){event.preventDefault();if(event.altKey)patchNodes(Object.fromEntries(projectRef.current.nodes.filter(n=>!n.visible).map(n=>[n.id,{visible:true}])));else{patchSelected({visible:false});setSelected([]);}return;}
+      if(event.code==='F2'){event.preventDefault();document.querySelector<HTMLInputElement>('[aria-label="Имя объекта"]')?.select();return;}
+      if(event.code==='KeyS'&&mod){event.preventDefault();void flush();return;}
+      if(event.code==='KeyN'&&!mod){setProperties(v=>!v);return;}
+      if(event.code==='KeyT'&&!mod){setRail(v=>!v);return;}
+      if(event.code==='KeyV'&&!mod){setTool('select');return;}
       if (event.key === 'Escape') { setPlaceKind(null); setSelectedNote(null); return; }
-      if (mod && event.key.toLowerCase() === 'z') { event.preventDefault(); event.shiftKey ? redo() : undo(); }
-      else if (mod && event.key.toLowerCase() === 'y') { event.preventDefault(); redo(); }
-      else if (mod && event.key.toLowerCase() === 'c') { event.preventDefault(); const current = projectRef.current; if (current) clipboard.current = current.nodes.filter(node => [...new Set(selected.flatMap(id => descendants(current.nodes, id)))].includes(node.id)).map(node => structuredClone(node)); }
-      else if (mod && event.key.toLowerCase() === 'v') { event.preventDefault(); paste(); }
+      if (mod && event.code === 'KeyZ') { event.preventDefault(); event.shiftKey ? redo() : undo(); }
+      else if (mod && event.code === 'KeyY') { event.preventDefault(); redo(); }
+      else if (mod && event.code === 'KeyC') { event.preventDefault(); const current = projectRef.current; if (current) clipboard.current = current.nodes.filter(node => [...new Set(selected.flatMap(id => descendants(current.nodes, id)))].includes(node.id)).map(node => structuredClone(node)); }
+      else if (mod && event.code === 'KeyV') { event.preventDefault(); paste(); }
       else if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); removeSelected(); }
     };
     document.addEventListener('keydown', keydown);
@@ -288,9 +352,12 @@ function App() {
       const canvas = document.querySelector<HTMLCanvasElement>('.viewport-canvas');
       const preview = await new Promise<Blob | null>(resolve => { if (canvas) canvas.toBlob(resolve, 'image/png'); else resolve(null); });
       const blob = await exportArchive(projectRef.current!, preview);
-      download(blob, `${project.name.replace(/[^\p{L}\p{N}-]+/gu, '-').slice(0, 60)}.mgmap.zip`);
-      setStatus('Все изменения сохранены');
-      setToast('Архив подготовлен. Скачивание начато.');
+      const filename=`${project.name.replace(/[^\p{L}\p{N}-]+/gu, '-').slice(0, 60)}.mgmap.zip`;
+      if(window.mapWindow){
+        const written=await window.mapWindow.saveArchive(filename,new Uint8Array(await blob.arrayBuffer()));
+        if(written)setToast('Архив сохранён на диск.');
+      }else{download(blob,filename);setToast('Архив подготовлен. Скачивание начато.');}
+      setStatus(savedRevision.current===revision.current?'Все изменения сохранены':'Ошибка сохранения — скачайте архив');
     } catch (error) { setStatus('Ошибка экспорта'); setToast(error instanceof Error ? error.message : 'Не удалось экспортировать карту.'); }
   };
   const importZip = async (file?: File) => {
@@ -340,33 +407,37 @@ function App() {
     </div>;
   });
 
-  const selectedNode = project?.nodes.find(node => node.id === selected[0]);
+
   const note = project?.notes.find(item => item.id === selectedNote);
 
   if (!project) return <main className="home-shell">
     <header className="home-header"><div className="brand-mark">M</div><div className="brand-name">Мастерская карт<span>3D редактор уровней</span></div><div className="home-version">Формат проекта 1.0</div></header>
-    <section className="home-hero"><div className="hero-eyebrow">МИР НАЧИНАЕТСЯ С КАРТЫ</div><h1>Соберите место,<br /><em>в котором будет история.</em></h1><p>Расставляйте декорации, прикрепляйте идеи к объектам и сохраняйте карту как понятный план будущего уровня.</p><div className="home-actions"><button className="primary-button" onClick={create}>＋ Создать карту</button><button className="secondary-button" onClick={() => archiveInput.current?.click()}>↥ Импортировать архив</button></div></section>
-    <section className="projects-section"><div className="section-heading"><div><span>ВАШИ ПРОЕКТЫ</span><h2>Продолжить работу</h2></div><span className="project-count">{projects.length} карт</span></div><div className="project-grid">{projects.length ? projects.map(item => <article className="project-card" key={item.id}><button className="project-open" onClick={() => choose(item.id)}><div className="project-art"><div className="art-sun" /><div className="art-hill one" /><div className="art-hill two" /><div className="art-tree">♠</div></div><strong>{item.name}</strong><span>{item.nodes.length} объектов · {item.notes.length} заметок</span><small>Изменена {new Date(item.updatedAt).toLocaleString('ru-RU')}</small></button><button className="card-delete" onClick={() => remove(item)} title="Удалить карту">×</button></article>) : <div className="empty-projects"><span>◇</span><strong>Здесь появятся ваши карты</strong><p>Начните с пустой сцены и расставьте первые объекты.</p></div>}</div></section>
+    <section className="home-hero"><h1>Мои карты</h1><div className="home-actions"><button className="primary-button" onClick={create}>＋ Создать карту</button><button className="secondary-button" onClick={() => archiveInput.current?.click()}>↥ Импортировать архив</button></div></section>
+    <section className="projects-section"><div className="section-heading"><div><span>ВАШИ ПРОЕКТЫ</span><h2>Продолжить работу</h2></div><span className="project-count">{projects.length} карт</span></div><div className="project-grid">{projects.length ? projects.map(item => <article className="project-card" key={item.id}><button className="project-open" onClick={() => choose(item.id)}><div className="project-art"><div className="art-sun" /><div className="art-hill one" /><div className="art-hill two" /><div className="art-tree">♠</div></div><strong>{item.name}</strong><span>{item.nodes.length} объектов · {item.notes.length} заметок</span><small>Изменена {new Date(item.updatedAt).toLocaleString('ru-RU')}</small></button><button className="card-delete" onClick={() => remove(item)} title="Удалить карту">×</button></article>) : <div className="empty-projects"><span>◇</span><strong>Здесь появятся ваши карты</strong><p>Создайте карту или импортируйте архив.</p></div>}</div></section>
     <input ref={archiveInput} type="file" accept=".zip,.mgmap.zip,application/zip" hidden onChange={event => importZip(event.target.files?.[0])} />
     {toast && <div className="toast" role="status">{toast}</div>}
   </main>;
 
   return <div className="app-shell">
-    <header className="editor-header"><button className="logo-button" onClick={returnHome} title="К списку карт"><span className="brand-mark small">M</span><span>Карты</span></button><div className="header-separator" /><input className="document-title" aria-label="Название карты" value={project.name} onChange={event => commit(old => ({ ...old, name: event.target.value || 'Новая карта' }))} /><span className={`save-state ${status.includes('Ошибка') ? 'error' : ''}`}><i />{status}</span><div className="header-spacer" /><button className="header-button" onClick={() => setShowFiles(true)}>Файлы</button><button className="header-button" onClick={exportZip}>↥ Экспорт карты</button></header>
-    <div className="editor-body">
+    <header className="editor-header"><button className="logo-button" onClick={returnHome} title="К списку карт"><span className="brand-mark small">M</span><span>Карты</span></button><div className="header-separator" /><input className="document-title" aria-label="Название карты" value={project.name} onChange={event => commit(old => ({ ...old, name: event.target.value || 'Новая карта' }))} /><span className={`save-state ${status.includes('Ошибка') ? 'error' : ''}`}><i />{status}</span><div className="header-spacer" /><button className="header-button" onClick={()=>setDialog('help')}>Клавиши</button><button className="header-button" onClick={() => setShowFiles(true)}>Файлы</button><button className="header-button" onClick={exportZip}>↥ Экспорт карты</button></header>
+    <div className={'editor-body '+(properties?'':'no-properties')}>
       <aside className="left-panel"><div className="panel-tabs"><button className={leftTab === 'library' ? 'active' : ''} onClick={() => setLeftTab('library')}>Декор</button><button className={leftTab === 'layers' ? 'active' : ''} onClick={() => setLeftTab('layers')}>Сцена</button><button className={leftTab === 'notes' ? 'active' : ''} onClick={() => setLeftTab('notes')}>Заметки</button></div>
         {leftTab === 'library' && <div className="panel-scroll library-panel"><div className="panel-intro"><strong>Библиотека объектов</strong><p>Выберите объект и нажмите на карте, чтобы поставить его.</p></div>{categories.map(category => <section className="library-category" key={category.title}><h3>{category.title}</h3><div className="prefab-grid">{category.kinds.map(kind => <button key={kind} className={`prefab ${placeKind === kind ? 'active' : ''}`} onClick={() => setPlaceKind(placeKind === kind ? null : kind)}><span className="prefab-icon" style={{ '--prefab-color': defaultColors[kind] } as CSSProperties}>{icon[kind]}</span><span>{names[kind]}</span></button>)}</div></section>)}<button className="import-art" onClick={() => pngInput.current?.click()}>＋ Добавить свой PNG</button><p className="library-footnote">Свои рисунки остаются в браузере и входят в архив карты.</p></div>}
         {leftTab === 'layers' && <div className="panel-scroll"><div className="scene-heading"><strong>Объекты сцены</strong><span>{project.nodes.length}</span></div><div className="layer-toolbar"><button onClick={groupSelection} disabled={!selected.length} title="Группа">▤ Группа</button><button onClick={ungroup} disabled={!selected.some(id => project.nodes.find(node => node.id === id)?.kind === 'group')}>Разгруппировать</button></div>{project.nodes.length ? <div className="layer-tree">{renderTree(null)}</div> : <div className="side-empty">Добавьте первый объект из библиотеки.</div>}<div className="side-help">Shift + клик — несколько объектов<br />Ctrl+C / Ctrl+V — копировать / вставить</div></div>}
         {leftTab === 'notes' && <div className="panel-scroll notes-panel"><div className="scene-heading"><strong>Заметки карты</strong><button className="small-add" onClick={() => addNote(selected[0] ?? null)}>＋</button></div>{project.notes.length ? project.notes.map(item => <button key={item.id} className={`note-list-item ${selectedNote === item.id ? 'active' : ''}`} onClick={() => { setSelectedNote(item.id); setSelected(item.targetId ? [item.targetId] : []); }}><span className="note-type-dot" /><strong>{item.title}</strong><small>{item.targetId ? project.nodes.find(node => node.id === item.targetId)?.name ?? 'Объект' : 'Вся карта'} · {noteTypes[item.type]}</small></button>) : <div className="side-empty">Прикрепите идею к объекту или оставьте заметку для всей карты.</div>}</div>}
       </aside>
-      <main className="work-area"><div className="tool-strip"><div className="tool-group"><button className={tool === 'move' ? 'active' : ''} onClick={() => { setTool('move'); setPlaceKind(null); }}>↔ <span>Переместить</span></button><button className={tool === 'rotate' ? 'active' : ''} onClick={() => { setTool('rotate'); setPlaceKind(null); }}>⟳ <span>Повернуть</span></button><button className={tool === 'scale' ? 'active' : ''} onClick={() => { setTool('scale'); setPlaceKind(null); }}>⤢ <span>Размер</span></button></div><div className="tool-divider" /><button className={project.snap ? 'toggle-on' : ''} onClick={() => commit(old => ({ ...old, snap: !old.snap }), false)}>⌗ <span>Привязка</span></button><button className={project.grid ? 'toggle-on' : ''} onClick={() => commit(old => ({ ...old, grid: !old.grid }), false)}>▦ <span>Сетка</span></button><div className="tool-spacer" /><button onClick={() => commit(old => ({ ...old, camera: { ...old.camera, mode: old.camera.mode === 'perspective' ? 'orthographic' : 'perspective' } }), false)}>{project.camera.mode === 'perspective' ? 'Перспектива' : 'Ортографический'}⌄</button></div>
-        <Viewport project={project} selected={selected} tool={tool} placeKind={placeKind} assetUrls={assetUrls} onSelect={ids => { setSelected(ids); setSelectedNote(null); }} onPlace={add} onTransform={patchNodes} onCamera={camera => commit(old => ({ ...old, camera }), false)} onNote={id => { setSelectedNote(id); setLeftTab('notes'); }} />
+      <main className="work-area"><div className="tool-strip"><button disabled={!canEdit} onClick={toggleEdit} title="Переключить режим · Tab">{editMode?'Режим граней':'Объектный режим'} ⌄</button><button onClick={()=>setDialog('add')}>＋ Добавить</button><div className="tool-spacer"/><button aria-pressed={project.snap} onClick={()=>commit(p=>({...p,snap:!p.snap}),false)}>Привязка</button><button aria-pressed={project.grid} onClick={()=>commit(p=>({...p,grid:!p.grid}),false)}>Сетка</button><button onClick={()=>commit(p=>({...p,camera:{...p.camera,mode:p.camera.mode==='perspective'?'orthographic':'perspective'}}),false)}>{project.camera.mode==='perspective'?'Перспектива':'Ортография'} ⌄</button></div>
+        {rail&&<div className="model-rail">{(Object.keys(commands) as (keyof typeof commands)[]).filter(k=>editMode||!['cut','bevel','extend'].includes(k)).map(k=><button key={k} className={tool===k?'active':''} title={commands[k][0]+' · '+commands[k][1]} aria-label={commands[k][0]} onClick={()=>{setPlaceKind(null);if(k==='cut'||k==='bevel'||k==='extend')command(k);else setTool(k);}}><Glyph name={k}/></button>)}</div>}
+        <div className="view-caption">{editMode?'Редактирование граней':'Объектный режим'}<small>{selectedNode?.name || 'Сцена'}</small></div>
+        <Viewport key={project.id} editMode={editMode} face={face} onFace={setFace} project={project} selected={selected} tool={tool} placeKind={placeKind} assetUrls={assetUrls} onSelect={ids => { setSelected(ids); setSelectedNote(null); if(ids.length!==1||ids[0]!==editing){setEditing(null);setFace(-1);} }} onPlace={add} onTransform={patchNodes} onCamera={camera => commit(old => ({ ...old, camera }), false)} onNote={id => { setSelectedNote(id); setLeftTab('notes'); }} />
         <footer className="status-bar"><span>1 единица = 1 метр</span><span>{project.nodes.length} объектов · {project.notes.length} заметок</span><span>Проект хранится на этом устройстве</span></footer>
       </main>
       <aside className="right-panel"><div className="inspector-heading">Свойства <span>{selected.length > 1 ? `${selected.length} объектов` : selectedNode ? names[selectedNode.kind] : note ? 'Заметка' : 'Карта'}</span></div><div className="panel-scroll inspector-scroll">
-        {note ? <><div className="inspector-section"><div className="section-label">ЗАМЕТКА</div><label className="field-label">Название<input value={note.title} onChange={event => patchNote({ title: event.target.value })} /></label><label className="field-label">Тип<select value={note.type} onChange={event => patchNote({ type: event.target.value as NoteType })}>{Object.entries(noteTypes).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select></label><label className="field-label">Привязка<select value={note.targetId ?? ''} onChange={event => patchNote({ targetId: event.target.value || null })}><option value="">Вся карта</option>{project.nodes.map(node => <option value={node.id} key={node.id}>{node.name}</option>)}</select></label><label className="field-label">Описание<textarea rows={8} value={note.body} onChange={event => patchNote({ body: event.target.value })} placeholder="Что должно происходить здесь?" /></label><label className="check-row"><input type="checkbox" checked={note.visible} onChange={event => patchNote({ visible: event.target.checked })} /> Показывать на карте</label><button className="danger-button" onClick={() => { commit(old => ({ ...old, notes: old.notes.filter(item => item.id !== note.id) })); setSelectedNote(null); }}>Удалить заметку</button></div></> : selectedNode ? <><div className="inspector-section"><div className="section-label">ОБЪЕКТ</div><label className="field-label">Название<input value={selectedNode.name} onChange={event => patchSelected({ name: event.target.value })} /></label><div className="property-id">ID: {selectedNode.id}</div><div className="check-grid"><label><input type="checkbox" checked={selectedNode.visible} onChange={event => patchSelected({ visible: event.target.checked })} /> Видимый</label><label><input type="checkbox" checked={selectedNode.locked} onChange={event => patchSelected({ locked: event.target.checked })} /> Заблокирован</label></div></div><div className="inspector-section"><div className="section-label">ПРЕОБРАЗОВАНИЕ</div><div className="property-caption">Положение · метры</div><div className="number-grid">{(['X', 'Y', 'Z'] as const).map((axis, i) => <NumericField key={`pos${axis}:${selectedNode.id}`} label={axis} value={selectedNode.position[i]} onCommit={value => patchSelected({ position: selectedNode.position.map((n, index) => i === index ? value : n) as [number, number, number] })} />)}</div><div className="property-caption">Поворот · градусы</div><div className="number-grid">{(['X', 'Y', 'Z'] as const).map((axis, i) => <NumericField key={`rot${axis}:${selectedNode.id}`} label={axis} value={selectedNode.rotation[i] * 180 / Math.PI} step={1} onCommit={value => patchSelected({ rotation: selectedNode.rotation.map((n, index) => i === index ? value * Math.PI / 180 : n) as [number, number, number] })} />)}</div><div className="property-caption">Размер</div><div className="number-grid">{(['X', 'Y', 'Z'] as const).map((axis, i) => <NumericField key={`scale${axis}:${selectedNode.id}`} label={axis} value={selectedNode.scale[i]} onCommit={value => patchSelected({ scale: selectedNode.scale.map((n, index) => i === index ? Math.max(.05, value) : n) as [number, number, number] })} />)}</div></div><div className="inspector-section"><div className="section-label">ВНЕШНИЙ ВИД</div><label className="color-field"><input type="color" value={selectedNode.color} onChange={event => patchSelected({ color: event.target.value })} /><span>Цвет объекта</span><code>{selectedNode.color}</code></label>{['sprite', 'tree', 'pine', 'bush'].includes(selectedNode.kind) && <label className="check-row"><input type="checkbox" checked={selectedNode.billboard ?? false} onChange={event => patchSelected({ billboard: event.target.checked })} /> Поворачивать к камере</label>}</div><div className="inspector-section"><div className="section-label">ДЛЯ БУДУЩЕЙ ИГРЫ</div><div className="check-grid vertical">{([['collision', 'Коллизия'], ['walkable', 'Проходная область'], ['spawn', 'Точка появления'], ['interactive', 'Интерактивный']] as const).map(([key, label]) => <label key={key}><input type="checkbox" checked={selectedNode[key]} onChange={event => patchSelected({ [key]: event.target.checked })} /> {label}</label>)}</div><label className="field-label">Переход на карту<input value={selectedNode.transitionTo} onChange={event => patchSelected({ transitionTo: event.target.value })} placeholder="Название другой карты" /></label><label className="field-label">Метки через запятую<input value={selectedNode.tags.join(', ')} onChange={event => patchSelected({ tags: event.target.value.split(',').map(value => value.trim()).filter(Boolean).slice(0, 20) })} placeholder="лес, вход, квест" /></label></div><div className="inspector-actions"><button onClick={() => addNote(selectedNode.id)}>✦ Прикрепить заметку</button><button onClick={duplicate}>⧉ Дублировать</button><button className="danger-button" onClick={removeSelected}>Удалить объект</button></div></> : <><div className="inspector-section"><div className="section-label">ОБ ЭТОЙ КАРТЕ</div><p className="inspector-copy">Выберите объект на холсте или в списке слоёв, чтобы изменить его свойства. У карты есть собственные цвета среды.</p><label className="color-field"><input type="color" value={project.skyColor} onChange={event => commit(old => ({ ...old, skyColor: event.target.value }))} /><span>Небо</span><code>{project.skyColor}</code></label><label className="color-field"><input type="color" value={project.groundColor} onChange={event => commit(old => ({ ...old, groundColor: event.target.value }))} /><span>Земля</span><code>{project.groundColor}</code></label><button className="wide-button" onClick={() => addNote(null)}>✦ Заметка для карты</button></div><div className="inspector-tip"><span>✦</span><strong>Карта как план игры</strong><p>Все объекты, рисунки, заметки и игровые пометки сохраняются в переносимом архиве.</p></div></>}
+        {!note && selected.length===1 && selectedNode?.solid && !selectedNode.locked && <ShapePanel key={selectedNode.id} solid={selectedNode.solid} apply={solid=>{patchSelected({solid});setFace(-1);}} editing={editMode} edit={toggleEdit} native={window.mapWindow?nativeEdit:undefined} busy={nativeBusy}/>}
+        {note ? <><div className="inspector-section"><div className="section-label">ЗАМЕТКА</div><label className="field-label">Название<input value={note.title} onChange={event => patchNote({ title: event.target.value })} /></label><label className="field-label">Тип<select value={note.type} onChange={event => patchNote({ type: event.target.value as NoteType })}>{Object.entries(noteTypes).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select></label><label className="field-label">Привязка<select value={note.targetId ?? ''} onChange={event => patchNote({ targetId: event.target.value || null })}><option value="">Вся карта</option>{project.nodes.map(node => <option value={node.id} key={node.id}>{node.name}</option>)}</select></label><label className="field-label">Описание<textarea rows={8} value={note.body} onChange={event => patchNote({ body: event.target.value })} placeholder="Что должно происходить здесь?" /></label><label className="check-row"><input type="checkbox" checked={note.visible} onChange={event => patchNote({ visible: event.target.checked })} /> Показывать на карте</label><button className="danger-button" onClick={() => { commit(old => ({ ...old, notes: old.notes.filter(item => item.id !== note.id) })); setSelectedNote(null); }}>Удалить заметку</button></div></> : selectedNode ? <><div className="inspector-section"><div className="section-label">ОБЪЕКТ</div><label className="field-label">Название<input aria-label="Имя объекта" value={selectedNode.name} onChange={event => patchSelected({ name: event.target.value })} /></label><div className="check-grid"><label><input type="checkbox" checked={selectedNode.visible} onChange={event => patchSelected({ visible: event.target.checked })} /> Видимый</label><label><input type="checkbox" checked={selectedNode.locked} onChange={event => patchSelected({ locked: event.target.checked })} /> Заблокирован</label></div></div><div className="inspector-section"><div className="section-label">ПРЕОБРАЗОВАНИЕ</div><div className="property-caption">Положение · метры</div><div className="number-grid">{([['X',0],['Y',2],['Z',1]] as const).map(([axis, i]) => <NumericField key={`pos${axis}:${selectedNode.id}`} label={axis} value={selectedNode.position[i]*(i===2?-1:1)} onCommit={value => patchSelected({ position: selectedNode.position.map((n, index) => i === index ? value*(i===2?-1:1) : n) as [number, number, number] })} />)}</div><div className="property-caption">Поворот · градусы</div><div className="number-grid">{([['X',0],['Y',2],['Z',1]] as const).map(([axis, i]) => <NumericField key={`rot${axis}:${selectedNode.id}`} label={axis} value={selectedNode.rotation[i] * (i===2?-1:1) * 180 / Math.PI} step={1} onCommit={value => patchSelected({ rotation: selectedNode.rotation.map((n, index) => i === index ? value * (i===2?-1:1) * Math.PI / 180 : n) as [number, number, number] })} />)}</div><div className="property-caption">Размер</div><div className="number-grid">{([['X',0],['Y',2],['Z',1]] as const).map(([axis, i]) => <NumericField key={`scale${axis}:${selectedNode.id}`} label={axis} value={selectedNode.scale[i]} onCommit={value => patchSelected({ scale: selectedNode.scale.map((n, index) => i === index ? Math.max(.05, value) : n) as [number, number, number] })} />)}</div></div><div className="inspector-section"><div className="section-label">ВНЕШНИЙ ВИД</div><label className="color-field"><input type="color" value={selectedNode.color} onChange={event => patchSelected({ color: event.target.value })} /><span>Цвет объекта</span><code>{selectedNode.color}</code></label>{['sprite', 'tree', 'pine', 'bush'].includes(selectedNode.kind) && <label className="check-row"><input type="checkbox" checked={selectedNode.billboard ?? false} onChange={event => patchSelected({ billboard: event.target.checked })} /> Поворачивать к камере</label>}</div><div className="inspector-section"><div className="section-label">ДЛЯ БУДУЩЕЙ ИГРЫ</div><div className="check-grid vertical">{([['collision', 'Коллизия'], ['walkable', 'Проходная область'], ['spawn', 'Точка появления'], ['interactive', 'Интерактивный']] as const).map(([key, label]) => <label key={key}><input type="checkbox" checked={selectedNode[key]} onChange={event => patchSelected({ [key]: event.target.checked })} /> {label}</label>)}</div><label className="field-label">Переход на карту<input value={selectedNode.transitionTo} onChange={event => patchSelected({ transitionTo: event.target.value })} placeholder="Название другой карты" /></label><label className="field-label">Метки через запятую<input value={selectedNode.tags.join(', ')} onChange={event => patchSelected({ tags: event.target.value.split(',').map(value => value.trim()).filter(Boolean).slice(0, 20) })} placeholder="лес, вход, квест" /></label></div><div className="inspector-actions"><button onClick={() => addNote(selectedNode.id)}>✦ Прикрепить заметку</button><button onClick={duplicate}>⧉ Дублировать</button><button className="danger-button" onClick={removeSelected}>Удалить объект</button></div></> : <><div className="inspector-section"><div className="section-label">ОБ ЭТОЙ КАРТЕ</div><p className="inspector-copy">Выберите фигуру на холсте или в дереве сцены.</p><button className="wide-button" onClick={() => addNote(null)}>✦ Заметка для карты</button></div></>}
       </div></aside>
     </div>
+    {dialog&&<ToolDialog kind={dialog} close={()=>setDialog(null)} add={addSolid}/>}
     {showFiles && <div className="modal-backdrop" onMouseDown={() => setShowFiles(false)}><div className="files-modal" onMouseDown={event => event.stopPropagation()}><button className="modal-close" onClick={() => setShowFiles(false)}>×</button><span className="modal-eyebrow">ПРОЕКТ И ФАЙЛЫ</span><h2>Продолжайте где угодно</h2><p>На этом устройстве карта сохраняется автоматически. Архив переносит её вместе с рисунками, заметками и структурой объектов.</p><button onClick={() => { setShowFiles(false); exportZip(); }}>↥ Скачать архив карты <span>.mgmap.zip</span></button><button onClick={() => { setShowFiles(false); archiveInput.current?.click(); }}>↧ Открыть архив карты <span>.mgmap.zip</span></button><button onClick={() => { setShowFiles(false); pngInput.current?.click(); }}>▧ Добавить свой рисунок <span>.png</span></button><div className="modal-foot">Архив проекта можно передать мне, чтобы я использовал его при разработке уровня в Godot.</div></div></div>}
     <input ref={archiveInput} type="file" accept=".zip,.mgmap.zip,application/zip" hidden onChange={event => importZip(event.target.files?.[0])} />
     <input ref={pngInput} type="file" accept="image/png,.png" hidden onChange={event => importPng(event.target.files?.[0])} />

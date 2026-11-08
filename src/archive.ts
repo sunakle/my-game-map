@@ -23,7 +23,7 @@ export function sceneOverview(project: MapProject): string {
 export async function exportArchive(project: MapProject, preview?: Blob | null): Promise<Blob> {
   validateProject(project);
   const files: Record<string, Uint8Array> = {
-    'project.json': strToU8(JSON.stringify(project, null, 2)),
+    'project.json': strToU8(JSON.stringify(project)),
     'overview.md': strToU8(sceneOverview(project)),
   };
   for (const asset of project.assets) {
@@ -32,7 +32,10 @@ export async function exportArchive(project: MapProject, preview?: Blob | null):
     files[`assets/${asset.id}.png`] = new Uint8Array(await blob.arrayBuffer());
   }
   if (preview) files['preview.png'] = new Uint8Array(await preview.arrayBuffer());
-  return new Blob([new Uint8Array(zipSync(files, { level: 6 }))], { type: 'application/zip' });
+  if(files['project.json'].length>MAX_ENTRY)throw new Error('Описание карты превышает 20 МиБ.');
+  const result=new Blob([new Uint8Array(zipSync(files,{level:6}))],{type:'application/zip'});
+  if(result.size>MAX_ARCHIVE)throw new Error('Архив превышает 30 МиБ.');
+  return result;
 }
 
 export async function importArchive(file: File): Promise<{ project: MapProject; images: Map<string, Blob> }> {
@@ -45,7 +48,7 @@ export async function importArchive(file: File): Promise<{ project: MapProject; 
   } catch {
     throw new Error('Архив повреждён или не является ZIP.');
   }
-  if (!files['project.json'] || files['project.json'].length > 3 * 1024 * 1024) throw new Error('Нет допустимого project.json.');
+  if (!files['project.json'] || files['project.json'].length > MAX_ENTRY) throw new Error('Нет допустимого project.json.');
   let raw: unknown;
   try { raw = JSON.parse(new TextDecoder().decode(files['project.json'])); }
   catch { throw new Error('Описание карты повреждено.'); }
@@ -71,6 +74,6 @@ export async function importArchive(file: File): Promise<{ project: MapProject; 
     images.set(asset.id, blob);
   }
   // Every import becomes an independent local project; object IDs and their links remain stable.
-  project = { ...project, id: crypto.randomUUID(), name: `${project.name} · импорт`, updatedAt: new Date().toISOString() };
+  project = { ...project, id: crypto.randomUUID(), name: `${project.name.slice(0,110)} · импорт`, updatedAt: new Date().toISOString() };
   return { project, images };
 }

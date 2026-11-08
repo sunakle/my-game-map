@@ -6,3 +6,6 @@ dist/
 .env*
 *.mgmap.zip
 !examples/*.mgmap.zip
+*.tsbuildinfo
+
+release/

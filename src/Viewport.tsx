@@ -1,15 +1,21 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { Kind, MapNode, MapProject } from './model';
 import { descendants } from './model';
 
-export type Tool = 'move' | 'rotate' | 'scale';
+import { solidGeometry } from './solids';
+import { modelingInput } from './interaction';
+
+export type Tool = 'select' | 'move' | 'rotate' | 'scale';
 type Patch = Record<string, Partial<MapNode>>;
 interface Props {
   project: MapProject;
   selected: string[];
   tool: Tool;
+  editMode: boolean;
+  face: number;
+  onFace(index: number): void;
   placeKind: Kind | null;
   assetUrls: Record<string, string>;
   onSelect(ids: string[]): void;
@@ -95,7 +101,7 @@ function paperTexture(kind: 'tree' | 'pine' | 'bush', color: string): THREE.Canv
   return texture;
 }
 
-function buildNode(node: MapNode, url?: string): THREE.Group {
+function buildNode(node: MapNode, url?: string, face = -1, edit = false): THREE.Group {
   const root = new THREE.Group();
   root.userData.nodeId = node.id;
   root.position.set(...node.position);
@@ -103,6 +109,14 @@ function buildNode(node: MapNode, url?: string): THREE.Group {
   root.scale.set(...node.scale);
   const c = node.color;
   switch (node.kind) {
+    case 'solid': {
+      if (!node.solid) break;
+      const mesh = new THREE.Mesh(solidGeometry(node.solid, face), [material(c), material('#ebb784')]);
+      mesh.name = 'solid-body';
+      root.add(mesh);
+      if (edit) root.add(new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry, 1), new THREE.LineBasicMaterial({color:'#37373b'})));
+      break;
+    }
     case 'tree': case 'pine': case 'bush': {
       const art = new THREE.Mesh(new THREE.PlaneGeometry(node.kind === 'bush' ? 2.25 : 2.5, node.kind === 'bush' ? 2.7 : 3.25),
         new THREE.MeshBasicMaterial({ map: paperTexture(node.kind, c), transparent: true, side: THREE.DoubleSide, alphaTest: .08, depthWrite: false }));
@@ -189,11 +203,12 @@ function dispose(root: THREE.Object3D) {
 }
 
 export function Viewport(props: Props) {
+  const [hint, setHint] = useState('');
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const live = useRef(props);
   live.current = props;
-  const runtime = useRef<{ scene: THREE.Scene; camera: THREE.Camera; controls: OrbitControls; renderer: THREE.WebGLRenderer; objects: Map<string, THREE.Group>; highlights: THREE.BoxHelper[]; grid: THREE.GridHelper } | null>(null);
+  const runtime = useRef<{ scene: THREE.Scene; camera: THREE.Camera; controls: OrbitControls; renderer: THREE.WebGLRenderer; objects: Map<string, THREE.Group>; highlights: THREE.BoxHelper[]; grid: THREE.Mesh } | null>(null);
 
   useEffect(() => {
     const element = canvas.current;
@@ -201,26 +216,28 @@ export function Viewport(props: Props) {
     if (!element || !parent) return;
     const renderer = new THREE.WebGLRenderer({ canvas: element, antialias: true, alpha: false, preserveDrawingBuffer: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.enabled = false;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(48, 1, .1, 1000);
     camera.position.set(...live.current.project.camera.position);
     const controls = new OrbitControls(camera, element);
-    controls.enableDamping = true;
+    controls.enableDamping = false;
     controls.dampingFactor = .08;
     controls.target.set(...live.current.project.camera.target);
-    controls.maxPolarAngle = Math.PI * .49;
+    controls.maxPolarAngle = Math.PI;
     controls.minDistance = 2;
     controls.maxDistance = 150;
-    controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+    controls.mouseButtons = {LEFT: null, MIDDLE: THREE.MOUSE.ROTATE, RIGHT: null};
+    const middle = (e: PointerEvent) => { if(e.button === 1) controls.mouseButtons.MIDDLE = e.ctrlKey ? THREE.MOUSE.DOLLY : THREE.MOUSE.ROTATE; };
+    element.addEventListener('pointerdown', middle, true);
     controls.addEventListener('end', () => {
-      live.current.onCamera({ mode: live.current.project.camera.mode, position: camera.position.toArray() as [number, number, number], target: controls.target.toArray() as [number, number, number] });
+      live.current.onCamera({ mode: live.current.project.camera.mode, zoom: controls.object instanceof THREE.OrthographicCamera ? controls.object.zoom : 1, position: controls.object.position.toArray() as [number, number, number], target: controls.target.toArray() as [number, number, number] });
     });
-    const ambient = new THREE.HemisphereLight('#f5f2de', '#435a58', 2.2);
+    const ambient = new THREE.HemisphereLight('#f5f6ff', '#656672', 1.6);
     scene.add(ambient);
-    const sun = new THREE.DirectionalLight('#fff5d6', 2.8);
+    const sun = new THREE.DirectionalLight('#ffffff', 2.3);
     sun.position.set(-15, 28, 12);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
@@ -231,9 +248,26 @@ export function Viewport(props: Props) {
     ground.position.y = -.06;
     ground.receiveShadow = true;
     ground.name = 'ground';
+    ground.visible = false;
     scene.add(ground);
-    const grid = new THREE.GridHelper(300, 300, '#7f9782', '#728a78');
-    grid.position.y = -.045;
+    const grid = new THREE.Mesh(new THREE.PlaneGeometry(600,600),new THREE.ShaderMaterial({
+      transparent:true,depthWrite:false,side:THREE.DoubleSide,
+      vertexShader:`varying vec3 world;void main(){vec4 p=modelMatrix*vec4(position,1.);world=p.xyz;gl_Position=projectionMatrix*viewMatrix*p;}`,
+      fragmentShader:`varying vec3 world;
+        void main(){
+          vec2 p=world.xz;
+          vec2 delta=max(fwidth(p),vec2(.00001));
+          vec2 edge=abs(fract(p+.5)-.5)/delta;
+          float fade=1.-smoothstep(35.,120.,length(world-cameraPosition));
+          float fine=(1.-smoothstep(.1,1.,min(edge.x,edge.y)))*fade;
+          vec3 col=vec3(.58,.59,.62);
+          float x=1.-smoothstep(.3,1.4,abs(p.y)/delta.y);
+          float y=1.-smoothstep(.3,1.4,abs(p.x)/delta.x);
+          col=mix(col,vec3(.76,.35,.36),x);col=mix(col,vec3(.40,.64,.44),y);
+          gl_FragColor=vec4(col,max(fine*.36,max(x,y)*.9*fade));
+        }`
+    }));
+    grid.rotation.x=-Math.PI/2;grid.position.y=-.001;
     scene.add(grid);
     const objects = new Map<string, THREE.Group>();
     const highlights: THREE.BoxHelper[] = [];
@@ -266,7 +300,7 @@ export function Viewport(props: Props) {
       const meshes = [...r.objects.values()].filter(obj => obj.visible);
       const picked = raycaster.intersectObjects(meshes, true).find(intersection => {
         const id = intersection.object.userData.nodeId as string | undefined;
-        return id && !live.current.project.nodes.find(node => node.id === id)?.locked;
+        return intersection.object instanceof THREE.Mesh && id && !live.current.project.nodes.find(node => node.id === id)?.locked;
       });
       const id = picked?.object.userData.nodeId as string | undefined;
       if (live.current.placeKind) {
@@ -277,6 +311,11 @@ export function Viewport(props: Props) {
         }
         return;
       }
+      if (live.current.editMode) {
+        if (id === live.current.selected[0] && picked?.object instanceof THREE.Mesh && picked.faceIndex != null)
+          live.current.onFace(picked.object.geometry.userData.faces?.[picked.faceIndex] ?? -1);
+        return;
+      }
       if (!id) { if (!event.shiftKey) live.current.onSelect([]); return; }
       if (event.shiftKey) {
         const old = live.current.selected;
@@ -285,6 +324,7 @@ export function Viewport(props: Props) {
       }
       const selected = live.current.selected.includes(id) ? live.current.selected : [id];
       live.current.onSelect(selected);
+      if (live.current.tool === 'select') return;
       const ids = [...new Set(selected.flatMap(value => descendants(live.current.project.nodes, value)))].filter(value => r.objects.has(value));
       const initial = new Map<string, { position: THREE.Vector3; rotation: THREE.Euler; scale: THREE.Vector3 }>();
       for (const value of ids) {
@@ -330,12 +370,16 @@ export function Viewport(props: Props) {
       if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
       live.current.onTransform(patch);
     };
+    const unbind = modelingInput(element, controls, objects, () => live.current, setHint);
     element.addEventListener('pointerdown', onDown);
     element.addEventListener('pointermove', onMove);
     element.addEventListener('pointerup', onUp);
     const preventContext = (event: MouseEvent) => event.preventDefault();
     element.addEventListener('contextmenu', preventContext);
     let frame = 0;
+    const axisButtons = [...parent.querySelectorAll<HTMLButtonElement>('[data-axis]')];
+    const axisVectors = [new THREE.Vector3(1,0,0),new THREE.Vector3(0,0,-1),new THREE.Vector3(0,1,0)];
+    const inverse = new THREE.Quaternion(), vector=new THREE.Vector3();
     const draw = () => {
       frame = requestAnimationFrame(draw);
       controls.update();
@@ -344,7 +388,14 @@ export function Viewport(props: Props) {
         if (object) object.rotation.y = Math.atan2(runtime.current!.camera.position.x - object.position.x, runtime.current!.camera.position.z - object.position.z);
       }
       for (const box of runtime.current?.highlights ?? []) box.update();
-      renderer.render(scene, runtime.current!.camera);
+      const activeCamera=runtime.current!.camera;
+      renderer.render(scene, activeCamera);
+      inverse.copy(activeCamera.quaternion).invert();
+      axisButtons.forEach((button,index)=>{
+        vector.copy(axisVectors[index]).applyQuaternion(inverse);
+        button.style.transform='translate('+Math.round(vector.x*25)+'px,'+Math.round(-vector.y*25)+'px)';
+        button.style.zIndex=vector.z>0?'3':'1';
+      });
       const pins = parent.querySelectorAll<HTMLElement>('[data-note-id]');
       for (const pin of pins) {
         const note = live.current.project.notes.find(value => value.id === pin.dataset.noteId);
@@ -363,6 +414,7 @@ export function Viewport(props: Props) {
     draw();
     return () => {
       cancelAnimationFrame(frame);
+      unbind(); element.removeEventListener('pointerdown',middle,true);
       observer.disconnect();
       element.removeEventListener('pointerdown', onDown);
       element.removeEventListener('pointermove', onMove);
@@ -372,7 +424,7 @@ export function Viewport(props: Props) {
       for (const object of objects.values()) { scene.remove(object); dispose(object); }
       for (const box of highlights) { scene.remove(box); dispose(box); }
       ground.geometry.dispose(); (ground.material as THREE.Material).dispose();
-      grid.geometry.dispose(); (grid.material as THREE.Material).dispose();
+      dispose(grid);
       renderer.dispose();
       runtime.current = null;
     };
@@ -385,7 +437,8 @@ export function Viewport(props: Props) {
     r.objects.clear();
     for (const node of props.project.nodes) {
       if (node.kind === 'group') continue;
-      const object = buildNode(node, node.assetId ? props.assetUrls[node.assetId] : undefined);
+      const edit = props.editMode && props.selected.includes(node.id);
+      const object = buildNode(node, node.assetId ? props.assetUrls[node.assetId] : undefined, edit ? props.face : -1, edit);
       let ancestor = node.parentId;
       let visible = node.visible;
       while (ancestor) {
@@ -400,9 +453,9 @@ export function Viewport(props: Props) {
     }
     const ground = r.scene.getObjectByName('ground') as THREE.Mesh;
     (ground.material as THREE.MeshStandardMaterial).color.set(props.project.groundColor);
-    r.scene.background = new THREE.Color(props.project.skyColor);
+    r.scene.background = new THREE.Color('#404145');
     r.grid.visible = props.project.grid;
-  }, [props.project.nodes, props.project.groundColor, props.project.skyColor, props.project.grid, props.assetUrls]);
+  }, [props.project.nodes, props.project.groundColor, props.project.skyColor, props.project.grid, props.assetUrls, props.editMode, props.face, props.selected]);
 
   useEffect(() => {
     const r = runtime.current;
@@ -417,7 +470,7 @@ export function Viewport(props: Props) {
       r.scene.add(box);
       r.highlights.push(box);
     }
-  }, [props.selected, props.project.nodes]);
+  }, [props.selected, props.project.nodes, props.editMode, props.face, props.assetUrls, props.project.grid]);
 
   useEffect(() => {
     const r = runtime.current;
@@ -428,6 +481,7 @@ export function Viewport(props: Props) {
       ? new THREE.OrthographicCamera(-w / h * 13, w / h * 13, 13, -13, .1, 1000)
       : new THREE.PerspectiveCamera(48, w / h, .1, 1000);
     camera.position.copy(old.position);
+    if (camera instanceof THREE.OrthographicCamera) { camera.zoom=props.project.camera.zoom ?? 1; camera.updateProjectionMatrix(); }
     r.camera = camera;
     r.controls.object = camera;
     r.controls.update();
@@ -435,7 +489,8 @@ export function Viewport(props: Props) {
 
   return <div ref={host} className="viewport" aria-label="3D-холст">
     <canvas ref={canvas} className="viewport-canvas" />
-    <div className="viewport-hint">ЛКМ — выбрать и переместить · Shift — несколько · ПКМ — сдвинуть вид · колесо — масштаб</div>
+    <div className="axis-navigator" aria-label="Вид по оси">{['X','Y','Z'].map((a,i)=><button key={a} data-axis={a} title={['Вид справа','Вид спереди','Вид сверху'][i]} onClick={()=>window.dispatchEvent(new KeyboardEvent('keydown',{code:['Numpad3','Numpad1','Numpad7'][i],bubbles:true}))}>{a}</button>)}</div>
+    <div className="viewport-hint">{hint || (props.editMode ? 'Выберите грань · E вытянуть · K срез · Ctrl B скруглить' : 'СКМ — вращать · Shift СКМ — сдвиг · Колесо — приблизить')}</div>
     {props.project.notes.filter(note => note.visible).map(note =>
       <button key={note.id} data-note-id={note.id} className="note-pin" onClick={() => props.onNote(note.id)} title={note.body || note.title}>✦ {note.title}</button>
     )}

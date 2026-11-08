@@ -1,6 +1,7 @@
+import type { Solid } from './solids.ts';
 import { z } from 'zod';
 
-export const kinds = ['tree', 'pine', 'bush', 'rock', 'grass', 'flower', 'water', 'road', 'bridge', 'fence', 'wall', 'tower', 'platform', 'sprite', 'group'] as const;
+export const kinds = ['tree', 'pine', 'bush', 'rock', 'grass', 'flower', 'water', 'road', 'bridge', 'fence', 'wall', 'tower', 'platform', 'sprite', 'group', 'solid'] as const;
 export type Kind = typeof kinds[number];
 export type NoteType = 'idea' | 'task' | 'behavior' | 'story' | 'question';
 
@@ -15,6 +16,7 @@ export interface MapNode {
   color: string;
   visible: boolean;
   locked: boolean;
+  solid?: Solid;
   assetId?: string;
   billboard?: boolean;
   collision: boolean;
@@ -52,7 +54,7 @@ export interface MapProject {
   nodes: MapNode[];
   notes: MapNote[];
   assets: AssetMeta[];
-  camera: { mode: 'perspective' | 'orthographic'; position: [number, number, number]; target: [number, number, number] };
+  camera: { mode: 'perspective' | 'orthographic'; position: [number, number, number]; target: [number, number, number]; zoom?: number };
   snap: boolean;
   grid: boolean;
   skyColor: string;
@@ -64,6 +66,13 @@ const hex = z.string().regex(/^#[0-9a-fA-F]{6}$/);
 const nodeSchema = z.object({
   id: z.uuid(), name: z.string().max(120), kind: z.enum(kinds), parentId: z.uuid().nullable(),
   position: vec, rotation: vec, scale: vec, color: hex, visible: z.boolean(), locked: z.boolean(),
+  solid: z.object({
+    primitive: z.enum(['cube','sphere','cone','cylinder']), radius: z.number().min(0).max(.75),
+    segments: z.number().int().min(1).max(8),
+    cuts: z.array(z.object({ normal: vec.refine(v=>Math.hypot(...v)>.001), offset:z.number().finite().min(-10000).max(10000) })).max(32),
+    mesh: z.object({vertices:z.array(vec).min(3).max(100000),faces:z.array(z.array(z.number().int().nonnegative()).min(3).max(65536)).min(1).max(150000),triangles:z.array(z.tuple([z.number().int().nonnegative(),z.number().int().nonnegative(),z.number().int().nonnegative()])).min(1).max(200000)}).optional(),
+    hull: z.array(vec).min(4).max(2048).optional(),
+  }).optional(),
   assetId: z.uuid().optional(), billboard: z.boolean().optional(), collision: z.boolean(),
   walkable: z.boolean(), spawn: z.boolean(), interactive: z.boolean(), transitionTo: z.string().max(120),
   tags: z.array(z.string().max(60)).max(20),
@@ -77,17 +86,17 @@ export const projectSchema = z.object({
   formatVersion: z.literal(1), id: z.uuid(), name: z.string().min(1).max(120), updatedAt: z.iso.datetime(),
   unit: z.literal('meter'), nodes: z.array(nodeSchema).max(2000), notes: z.array(noteSchema).max(1000),
   assets: z.array(z.object({ id: z.uuid(), name: z.string().max(120), mime: z.literal('image/png'), width: z.number().int().min(1).max(8192), height: z.number().int().min(1).max(8192) })).max(100),
-  camera: z.object({ mode: z.enum(['perspective', 'orthographic']), position: vec, target: vec }),
+  camera: z.object({ mode: z.enum(['perspective', 'orthographic']), position: vec, target: vec, zoom:z.number().positive().max(100000).optional() }),
   snap: z.boolean(), grid: z.boolean(), skyColor: hex, groundColor: hex,
 });
 
 export const names: Record<Kind, string> = {
-  tree: 'Лиственное дерево', pine: 'Сосна', bush: 'Куст', rock: 'Камень', grass: 'Пучок травы',
+  solid: 'Фигура', tree: 'Лиственное дерево', pine: 'Сосна', bush: 'Куст', rock: 'Камень', grass: 'Пучок травы',
   flower: 'Цветок', water: 'Вода', road: 'Дорожка', bridge: 'Мост', fence: 'Забор',
   wall: 'Стена', tower: 'Башня', platform: 'Площадка', sprite: 'Мой рисунок', group: 'Группа',
 };
 export const defaultColors: Record<Kind, string> = {
-  tree: '#78946b', pine: '#5d8370', bush: '#91a56b', rock: '#9ba5a2', grass: '#98ad65',
+  solid: '#bdbec4', tree: '#78946b', pine: '#5d8370', bush: '#91a56b', rock: '#9ba5a2', grass: '#98ad65',
   flower: '#efa16f', water: '#6eabb4', road: '#aa947b', bridge: '#a47e62', fence: '#a17c5e',
   wall: '#9b9d94', tower: '#a7a79c', platform: '#83966f', sprite: '#ffffff', group: '#d7cba9',
 };
@@ -96,7 +105,7 @@ export function newProject(name = 'Новая карта'): MapProject {
   return {
     formatVersion: 1, id: crypto.randomUUID(), name, updatedAt: new Date().toISOString(), unit: 'meter',
     nodes: [], notes: [], assets: [],
-    camera: { mode: 'perspective', position: [18, 16, 18], target: [0, 0, 0] },
+    camera: { mode: 'perspective', position: [7, 5, 8], target: [0, 0, 0] },
     snap: true, grid: true, skyColor: '#b8cbd1', groundColor: '#78916f',
   };
 }
@@ -117,6 +126,9 @@ export function validateProject(input: unknown): MapProject {
   if (ids.size !== project.nodes.length) throw new Error('В карте повторяются идентификаторы объектов.');
   const assetIds = new Set(project.assets.map(asset => asset.id));
   for (const node of project.nodes) {
+    if(node.kind==='solid' && !node.solid) throw new Error('Нет геометрии фигуры.');
+    const mesh=node.solid?.mesh;
+    if(mesh && [...mesh.faces,...mesh.triangles].some(face=>face.some(i=>i>=mesh.vertices.length))) throw new Error('Повреждены грани фигуры.');
     if (node.parentId && (!ids.has(node.parentId) || node.parentId === node.id)) throw new Error('Повреждена иерархия объектов.');
     if (node.assetId && !assetIds.has(node.assetId)) throw new Error('Отсутствует изображение объекта.');
   }
